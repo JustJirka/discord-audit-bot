@@ -1,0 +1,11 @@
+services:
+  discord-audit-bot:
+    build: .
+    container_name: discord-audit-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - LOG_CHANNEL_ID=${LOG_CHANNEL_ID}
+    # You can also mount the .env file if you prefer
+    # env_file:
+    #   - .env

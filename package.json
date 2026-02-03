@@ -1,0 +1,17 @@
+{
+  "name": "discord-audit-log-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot that notifies a channel when an audit log entry is created.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.4.1"
+  },
+  "engines": {
+    "node": ">=16.9.0"
+  }
+}
