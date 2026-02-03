@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  discord-audit-bot:
+    # -------------------------------------------------------------------------
+    # INSTRUCTION: Replace the URL below with your actual GitHub HTTPS URL.
+    # Example: https://github.com/YourUsername/YourRepo.git
+    # -------------------------------------------------------------------------
+    build: https://github.com/JustJirka/discord-audit-bot.git
+    
+    container_name: discord-audit-bot
+    restart: unless-stopped
+    
+    # You can enter your secrets directly here if you don't want a separate .env file
+    # on your server.
+    environment:
+      - DISCORD_TOKEN=your_token_here
+      - LOG_CHANNEL_ID=your_channel_id_here
