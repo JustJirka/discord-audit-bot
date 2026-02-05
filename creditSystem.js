@@ -54,10 +54,15 @@ function modifyCredits(userId, amount) {
     return creditData[userId];
 }
 
+function getAllCredits() {
+    return creditData;
+}
+
 // Initial load
 loadCredits();
 
 module.exports = {
     getCredits,
-    modifyCredits
+    modifyCredits,
+    getAllCredits
 };

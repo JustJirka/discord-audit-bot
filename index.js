@@ -1,11 +1,88 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, AuditLogEvent, EmbedBuilder, Events } = require('discord.js');
-const Sentiment = require('sentiment');
-const { modifyCredits, getCredits } = require('./creditSystem');
+const { modifyCredits, getCredits, getAllCredits } = require('./creditSystem');
 const auditConfig = require('./auditConfig');
 const CZECH_BAD_WORDS = require('./vulgarities');
+const czechSentiment = require('./czechSentiment'); // Fallback
+const { spawn } = require('child_process');
 
-const sentiment = new Sentiment();
+// --- PYTHON BRIDGE SETUP ---
+let sentimentProcess = null;
+let isPythonReady = false;
+const pendingRequests = []; // Queue for messages waiting for sentiment
+
+function startPythonBridge() {
+    console.log('Starting Python Sentiment Engine...');
+    // python or python3 depending on system. Trying 'python' first.
+    // In some docker containers it might be python3.
+    // For Windows 'python' is usually correct if added to PATH.
+    sentimentProcess = spawn('python', ['sentiment_engine.py']);
+
+    sentimentProcess.stdout.on('data', (data) => {
+        const lines = data.toString().split('\n');
+        lines.forEach(line => {
+            line = line.trim();
+            if (!line) return;
+
+            if (line === 'READY') {
+                console.log('Python Sentiment Engine is READY.');
+                isPythonReady = true;
+                return;
+            }
+
+            // Attempt to parse JSON response
+            // We need a mechanism to match requests to responses if we want async.
+            // The simplest way for a chat bot without high concurrency requirement 
+            // is to process one by one or attach an ID.
+            // However, since we are just piping lines, if we process sequentially 
+            // and the user sends many messages, we might get desynced if we don't track IDs.
+            // BUT, for simplicity in this "hacky" bridge, let's assume FIFO for current implementation
+            // OR simpler: we don't use a queue for the RESPONSE, we just handle the "next" callback.
+
+            if (pendingRequests.length > 0) {
+                const { resolve } = pendingRequests.shift();
+                try {
+                    const json = JSON.parse(line);
+                    resolve(json);
+                } catch (e) {
+                    console.error('Failed to parse Python output:', line);
+                    resolve(null); // Resolve with null to fallback
+                }
+            }
+        });
+    });
+
+    sentimentProcess.stderr.on('data', (data) => {
+        console.error(`Python Error: ${data}`);
+    });
+
+    sentimentProcess.on('close', (code) => {
+        console.log(`Python process exited with code ${code}`);
+        isPythonReady = false;
+        // Optional: Restart?
+        // setTimeout(startPythonBridge, 5000);
+    });
+}
+
+function analyzeWithPython(text) {
+    return new Promise((resolve) => {
+        if (!isPythonReady || !sentimentProcess) {
+            resolve(null); // Fallback immediately
+            return;
+        }
+
+        // Add to queue
+        pendingRequests.push({ resolve });
+
+        // Write to stdin
+        // Ensure no newlines in text break the protocol
+        const safeText = text.replace(/\n/g, ' ') + '\n';
+        sentimentProcess.stdin.write(safeText);
+    });
+}
+
+// Start the bridge
+startPythonBridge();
 
 const client = new Client({
     intents: [
@@ -18,10 +95,84 @@ const client = new Client({
 
 const TARGET_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
     console.log(`Logged in as ${client.user.tag}`);
     if (!TARGET_CHANNEL_ID) {
         console.warn('WARNING: LOG_CHANNEL_ID is not set in environment variables.');
+    }
+
+    // Register /1984 command
+    const data = [
+        {
+            name: '1984',
+            description: 'Shows the Social Credit Leaderboard for this channel.',
+        }
+    ];
+
+    try {
+        console.log('Refreshing application (/) commands...');
+        await client.application.commands.set(data);
+        console.log('Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error('Error refreshing commands:', error);
+    }
+});
+
+// --- INTERACTION HANDLER (/1984) ---
+client.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === '1984') {
+        const allCredits = getAllCredits();
+        // Get members in current channel/guild to filter or just show top global?
+        // User asked: "users in the channel where it is written"
+        // We need to fetch channel members. Note: in large guilds this is expensive, 
+        // but for a small bot it's fine. 
+        // Best approach: Iterate over credit data and check if they are in the channel.
+
+        const channel = interaction.channel;
+        if (!channel) return;
+
+        const leaderboard = [];
+
+        for (const [userId, score] of Object.entries(allCredits)) {
+            // Check if user is in this channel (permissions wise)
+            // Ideally we check interaction.guild.members.cache
+            try {
+                // We rely on cache or fetch. For speed, cache.
+                const member = interaction.guild.members.cache.get(userId);
+                if (member) {
+                    // Check if they can view this channel? 
+                    // Or "users in the channel" implies members present.
+                    // Let's just list known members.
+                    leaderboard.push({ tag: member.user.tag, score: score });
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        // Sort descending
+        leaderboard.sort((a, b) => b.score - a.score);
+
+        // Format
+        const topList = leaderboard.slice(0, 20).map((entry, index) => {
+            let icon = '😐';
+            if (entry.score >= 1500) icon = '🌟';
+            else if (entry.score >= 1000) icon = '✅';
+            else if (entry.score < 500) icon = '⚠️';
+            else if (entry.score < 0) icon = '💀';
+
+            return `**${index + 1}.** ${entry.tag}: **${entry.score}** ${icon}`;
+        }).join('\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle('📜 Ministry of Truth: Social Credit Logs')
+            .setDescription(topList || 'No citizens found in the registry.')
+            .setColor('DarkRed')
+            .setTimestamp();
+
+        await interaction.reply({ embeds: [embed] });
     }
 });
 
@@ -32,41 +183,77 @@ client.on(Events.MessageCreate, async (message) => {
 
     const contentLower = message.content.toLowerCase();
 
-    // 1. Check for Bad Words
+    // 1. Check for Bad Words first (Fast fail)
     const foundBadWord = CZECH_BAD_WORDS.find(word => contentLower.includes(word));
 
     let creditChange = 0;
-    let replyMsg = '';
     let newTotal = 0;
+    let reason = '';
+    let isPositive = false;
 
     if (foundBadWord) {
         // Vulgarity detected
         creditChange = -100;
         newTotal = modifyCredits(message.author.id, creditChange);
-        replyMsg = `⚠️ **LANGUAGE VIOLATION!**\nDetected vulgar vocabulary: ||${foundBadWord}||\nSocial Credits **${creditChange}**\nTotal Score: **${newTotal}**\n*Watch your tongue, citizen.*`;
+        reason = `Language Violation (Vocabulary: ${foundBadWord})`;
+        isPositive = false;
     } else {
-        // 2. Sentiment Analysis (if no bad words)
-        const result = sentiment.analyze(message.content);
-        const score = result.score;
-        const multiplier = 5;
-        creditChange = score * multiplier;
+        // 2. Python AI Analysis
+        let score = 0;
+        // Try Python first
+        const pythonResult = await analyzeWithPython(message.content);
+
+        if (pythonResult && pythonResult.score !== undefined) {
+            // Python sent a score (-2 to 2)
+            score = pythonResult.score; // Already mapped roughly
+            // Scale it up. 1 star (-2) -> -20, 5 stars (2) -> +20
+            creditChange = score * 10;
+        } else {
+            // Fallback to JS Heuristic
+            const Sentiment = require('sentiment'); // Re-require purely for fallback logic structure
+            const sentiment = new Sentiment();
+            sentiment.registerLanguage('cs', czechSentiment);
+
+            const result = sentiment.analyze(message.content, {
+                language: 'cs',
+                scoringStrategy: czechSentiment.scoringStrategy
+            });
+
+            // JS score is raw sum (e.g. 3)
+            creditChange = result.score * 5;
+        }
 
         if (creditChange === 0) return; // Ignore neutral messages
 
+        isPositive = creditChange > 0;
+        reason = isPositive ? 'Positive Citizen Sentiment' : 'Negative Citizen Sentiment';
         newTotal = modifyCredits(message.author.id, creditChange);
-
-        if (creditChange > 0) {
-            replyMsg = `✅ **Good Citizen!**\nSocial Credits **+${creditChange}**\nTotal Score: **${newTotal}**\n*Glory to the Server!*`;
-        } else {
-            replyMsg = `⚠️ **ATTENTION CITIZEN!**\nNegative attitude detected!\nSocial Credits **${creditChange}**\nTotal Score: **${newTotal}**\n*Be more positive.*`;
-        }
     }
 
-    // Reply to the user
+    // --- REPORT TO LOG CHANNEL ONLY ---
+    if (!TARGET_CHANNEL_ID) return;
+
     try {
-        await message.reply(replyMsg);
+        const logChannel = await client.channels.fetch(TARGET_CHANNEL_ID);
+        if (logChannel) {
+            const embed = new EmbedBuilder()
+                .setTitle(isPositive ? '✅ Citizen Sentiment Analysis' : '⚠️ Citizen Sentiment Alert')
+                .setColor(isPositive ? 'Green' : 'Red')
+                .setAuthor({ name: message.author.tag, iconURL: message.author.displayAvatarURL() })
+                .setDescription(`**Message:** "${message.content}"`)
+                .addFields(
+                    { name: 'Analysis', value: `${isPositive ? 'POSITIVE' : 'NEGATIVE'}`, inline: true },
+                    { name: 'Score Change', value: `${creditChange > 0 ? '+' : ''}${creditChange}`, inline: true },
+                    { name: 'New Total', value: `${newTotal}`, inline: true },
+                    { name: 'Reason', value: reason }
+                )
+                .setFooter({ text: 'Ministry of Truth Surveillance' })
+                .setTimestamp();
+
+            await logChannel.send({ embeds: [embed] });
+        }
     } catch (err) {
-        console.error('Failed to reply to message:', err);
+        console.error('Failed to log sentiment:', err);
     }
 });
 
@@ -115,15 +302,15 @@ client.on(Events.GuildAuditLogEntryCreate, async (auditLogEntry, guild) => {
             }
 
             // Special Case: MemberUpdate (Timeouts)
-            // If it's MemberUpdate, we need to check if it was actually a timeout.
-            // Config default for MemberUpdate is -50. But Timeout is severe.
+            // If it's MemberUpdate, check if it was actually a timeout.
             if (action === AuditLogEvent.MemberUpdate) {
                 const timeoutChange = changes.find(c => c.key === 'communication_disabled_until');
                 if (timeoutChange && timeoutChange.new) {
-                    creditDeduction = -200;
-                    scMessage = 'Timeout Issued (Communication Rights Suspended).';
-                    recipientId = targetId;
-                    recipientUser = targetUser;
+                    // Punish the Executor for silencing the user (Limit of Speech?)
+                    creditDeduction = -50;
+                    scMessage = 'Issued Timeout (Suppression of Speech).';
+                    recipientId = executorId;
+                    recipientUser = executor;
                 }
             }
         }
