@@ -1,0 +1,23 @@
+module.exports = [
+    "curak", "čurák",
+    "debil",
+    "kokot",
+    "picus", "pičus",
+    "pica", "piča",
+    "kurva",
+    "mrdka",
+    "hovno",
+    "srac", "sráč",
+    "buzna",
+    "buzerant",
+    "negr", "negři",
+    "zmrd",
+    "prdel",
+    "cyp",
+    "kunda",
+    "seru",
+    "vyser",
+    "nasrat",
+    "zkurvysyn",
+    "jebat"
+];
