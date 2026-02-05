@@ -18,6 +18,11 @@ function startPythonBridge() {
     // For Windows 'python' is usually correct if added to PATH.
     sentimentProcess = spawn('python', ['sentiment_engine.py']);
 
+    sentimentProcess.on('error', (err) => {
+        console.error('Failed to start Python Sentiment Engine (will fallback to JS):', err.message);
+        isPythonReady = false;
+    });
+
     sentimentProcess.stdout.on('data', (data) => {
         const lines = data.toString().split('\n');
         lines.forEach(line => {
